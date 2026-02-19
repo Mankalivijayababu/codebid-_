@@ -5,18 +5,19 @@ const { protect, adminOnly } = require("../middleware/auth");
 
 const router = express.Router();
 
-/* HELPER */
+/* ================= HELPER ================= */
 const getActiveRound = async () => {
   return await Round.findOne({
     status: { $in: ["bidding", "reviewing"] },
   });
 };
 
-/* GAME STATE */
+/* ================= GAME STATE ================= */
 router.get("/state", protect, async (req, res) => {
   try {
     const round = await getActiveRound();
 
+    // Leaderboard
     const teams = await Team.find({ isActive: true }).sort({ coins: -1 });
 
     const leaderboard = teams.map((t, i) => ({
@@ -27,17 +28,27 @@ router.get("/state", protect, async (req, res) => {
       wrongAnswers: t.wrongAnswers,
     }));
 
+    // Send logged-in team info
+    let team = null;
+
+    if (req.user.role === "team") {
+      team = await Team.findById(req.user.id)
+        .select("teamName coins correctAnswers wrongAnswers totalBids");
+    }
+
     res.json({
       success: true,
       round,
       leaderboard,
+      team,
     });
+
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-/* START ROUND */
+/* ================= START ROUND ================= */
 router.post("/start", protect, adminOnly, async (req, res) => {
   try {
     const { title, category } = req.body;
@@ -74,7 +85,7 @@ router.post("/start", protect, adminOnly, async (req, res) => {
   }
 });
 
-/* PLACE BID */
+/* ================= PLACE BID ================= */
 router.post("/bid", protect, async (req, res) => {
   try {
     if (req.user.role === "admin")
@@ -119,7 +130,7 @@ router.post("/bid", protect, async (req, res) => {
   }
 });
 
-/* END BIDDING */
+/* ================= END BIDDING ================= */
 router.post("/end-bidding", protect, adminOnly, async (req, res) => {
   try {
     const round = await getActiveRound();
@@ -157,7 +168,7 @@ router.post("/end-bidding", protect, adminOnly, async (req, res) => {
   }
 });
 
-/* RESULT */
+/* ================= RESULT ================= */
 router.post("/result", protect, adminOnly, async (req, res) => {
   try {
     const { result } = req.body;
@@ -194,9 +205,10 @@ router.post("/result", protect, adminOnly, async (req, res) => {
     round.result = result;
     await round.save();
 
+    // 🔥 FINAL FIXED EMIT
     req.app.get("io").emit("round:completed", {
-      winner: team.teamName,
-      result,
+      teamName: team.teamName,
+      result: result,
     });
 
     res.json({ success: true });
@@ -205,7 +217,7 @@ router.post("/result", protect, adminOnly, async (req, res) => {
   }
 });
 
-/* FORCE RESET */
+/* ================= FORCE RESET ================= */
 router.patch("/force-reset", protect, adminOnly, async (req, res) => {
   try {
     const round = await getActiveRound();
