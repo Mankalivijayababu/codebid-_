@@ -26,29 +26,36 @@ const server = http.createServer(app);
 connectDB();
 
 /* ───────────────────────────────────────────────
-   🌐 CORS CONFIG
+   🌐 CORS CONFIG (PRODUCTION SAFE)
+   Allows:
+   - localhost
+   - vercel deployments (preview + prod)
+   - render apps
 ─────────────────────────────────────────────── */
-
-const allowedOrigins = [
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "https://codebid.onrender.com",
-  "https://codebid-frontend.vercel.app",
-
-  process.env.CLIENT_URL,
-  process.env.CLIENT_URLS
-].filter(Boolean);
 
 app.use(
   cors({
-    origin: (origin, callback) => {
+    origin: function (origin, callback) {
+
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error(`CORS blocked: ${origin}`));
+
+      if (
+        origin.includes("localhost") ||
+        origin.includes("127.0.0.1") ||
+        origin.includes("vercel.app") ||
+        origin.includes("onrender.com")
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("CORS blocked: " + origin));
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   })
 );
+
+app.options("*", cors());
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -56,18 +63,30 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/keepalive", (req, res) => res.send("alive"));
 
 /* ───────────────────────────────────────────────
-   📡 SOCKET.IO SETUP (FIXED FOR RENDER)
+   📡 SOCKET.IO SETUP (PRODUCTION SAFE)
 ─────────────────────────────────────────────── */
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+
+      if (
+        origin.includes("localhost") ||
+        origin.includes("127.0.0.1") ||
+        origin.includes("vercel.app") ||
+        origin.includes("onrender.com")
+      ) {
+        return callback(null, true);
+      }
+
+      callback(new Error("Socket CORS blocked"));
+    },
     methods: ["GET", "POST"],
     credentials: true,
   },
 
-  transports: ["websocket"], // 🔥 FIX
-
+  transports: ["websocket"],
   pingTimeout: 60000,
   pingInterval: 25000,
 });
