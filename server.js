@@ -4,51 +4,49 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+
 const connectDB = require("./config/db");
 
-// ── Routes ─────────────────────────────────────
+/* ── ROUTES ───────────────────────────────────── */
 const authRoutes = require("./routes/auth");
 const adminAuthRoutes = require("./routes/adminAuth");
 const gameRoutes = require("./routes/game");
 const teamRoutes = require("./routes/teams");
 
-// ── Socket events ──────────────────────────────
+/* ── SOCKET EVENTS ────────────────────────────── */
 const registerSocketEvents = require("./socket/gameEvents");
 
-// ── Models ─────────────────────────────────────
+/* ── MODELS ───────────────────────────────────── */
 const Round = require("./models/Round");
 
-// ── Init ───────────────────────────────────────
+/* ── INIT ─────────────────────────────────────── */
 const app = express();
 const server = http.createServer(app);
 
-// ── CONNECT DATABASE ───────────────────────────
+/* ============================================================
+   🗄️ DATABASE CONNECTION
+============================================================ */
 connectDB();
 
 /* ============================================================
-   🌐 GLOBAL CORS CONFIG (FINAL FIX)
-   Allows:
-   - localhost
-   - Vercel preview + production
-   - Render apps
-   - Any hackathon device
+   🌐 GLOBAL CORS CONFIG (Hackathon Safe)
 ============================================================ */
 
 app.use(cors({
-  origin: true,          // allow all origins
+  origin: true,
   credentials: true
 }));
 
-// Handle preflight
 app.options("*", cors());
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+/* KEEP ALIVE FOR RENDER */
 app.get("/keepalive", (req, res) => res.send("alive"));
 
 /* ============================================================
-   📡 SOCKET.IO SETUP (PRODUCTION SAFE)
+   📡 SOCKET.IO ENGINE
 ============================================================ */
 
 const io = new Server(server, {
@@ -66,6 +64,7 @@ app.set("io", io);
 
 /* ============================================================
    🛡️ ROUND RECOVERY ENGINE
+   Restores projector state if server restarts mid-round
 ============================================================ */
 
 async function recoverActiveRound(io) {
@@ -76,15 +75,27 @@ async function recoverActiveRound(io) {
 
     if (!round) return;
 
-    console.log("🛡️ Active round restored");
+    console.log("🛡️ Active round restored after restart");
 
-    io.emit("round:started", {
-      roundNumber: round.roundNumber,
-      title: round.title,
+    /* SHOW QUESTION AGAIN ON PROJECTOR */
+    io.emit("projector:show-question", {
+      question: round.title,
+      options: round.options || [],
       category: round.category,
-      status: round.status,
-      duration: 30,
     });
+
+    /* IF BIDDING PHASE */
+    if (round.status === "bidding") {
+      io.emit("bidding:start");
+    }
+
+    /* IF ANSWERING PHASE */
+    if (round.status === "reviewing") {
+      io.emit("projector:show-winner", {
+        teamName: round.winnerName,
+        bidAmount: round.winningBid,
+      });
+    }
 
   } catch (err) {
     console.log("Recovery failed:", err.message);
@@ -92,13 +103,14 @@ async function recoverActiveRound(io) {
 }
 
 /* ============================================================
-   SOCKET EVENTS
+   🔌 REGISTER SOCKET EVENTS
 ============================================================ */
 
 registerSocketEvents(io);
 
 /* ============================================================
-   ROUTES
+   📦 REST ROUTES
+   Used for login, data fetch, fallback sync
 ============================================================ */
 
 app.use("/api/auth", authRoutes);
@@ -113,6 +125,7 @@ app.use("/api/teams", teamRoutes);
 app.get("/", (req, res) => {
   res.json({
     message: "⚡ CODEBID SERVER RUNNING",
+    mode: "Realtime Event Engine",
     status: "OK",
   });
 });
@@ -133,7 +146,7 @@ app.use((req, res) => {
 ============================================================ */
 
 app.use((err, req, res, next) => {
-  console.error("💥 Error:", err.message);
+  console.error("💥 Server Error:", err.message);
 
   res.status(err.status || 500).json({
     success: false,
@@ -154,21 +167,24 @@ process.on("unhandledRejection", (err) => {
 });
 
 /* ============================================================
-   START SERVER
+   🚀 START SERVER
 ============================================================ */
 
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, async () => {
+
   await recoverActiveRound(io);
 
   console.log(`
-⚡ =====================================
+⚡ =========================================
         CODEBID FEST SERVER LIVE
-⚡ =====================================
+⚡ =========================================
 🚀 Port        : ${PORT}
 📡 Socket.io   : Realtime active
 🗄️  Database   : Connected
-========================================
+🛡️ Recovery    : Enabled
+🌐 CORS        : Hackathon Safe
+============================================
   `);
 });

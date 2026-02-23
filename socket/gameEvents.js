@@ -4,32 +4,23 @@ const Round = require("../models/Round");
 
 module.exports = (io) => {
 
-  /* ───────────────── AUTH MIDDLEWARE ───────────────── */
+  /* ───────── AUTH MIDDLEWARE ───────── */
 
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
-
-      if (!token) return next(new Error("No token provided"));
+      if (!token) return next(new Error("No token"));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-      /* ADMIN AUTH */
-
       if (decoded.role === "admin" || decoded.role === "superadmin") {
-        socket.user = {
-          role: "admin",
-          email: decoded.email,
-        };
+        socket.user = { role: "admin", email: decoded.email };
         return next();
       }
 
-      /* TEAM AUTH */
-
       const team = await Team.findById(decoded.id);
-
       if (!team || !team.isActive)
-        return next(new Error("Team not found or inactive"));
+        return next(new Error("Team inactive"));
 
       socket.user = {
         role: "team",
@@ -38,183 +29,220 @@ module.exports = (io) => {
       };
 
       next();
-
     } catch (err) {
-      console.log("Socket auth error:", err.message);
       next(new Error("Invalid token"));
     }
   });
 
-  /* ───────────────── SOCKET CONNECTION ───────────────── */
+  /* ───────── CONNECTION ───────── */
 
   io.on("connection", async (socket) => {
-    try {
 
-      const { user } = socket;
+    const { user } = socket;
 
-      console.log(`🔌 ${user.role} connected`);
+    if (user.role === "admin") socket.join("admin-room");
+    if (user.role === "team") socket.join("teams-room");
 
-      /* ───── JOIN ROOMS ───── */
+    /* =====================================================
+       ADMIN START QUESTION (LOCKED)
+    ===================================================== */
 
-      if (user.role === "admin") {
-        socket.join("admin-room");
-        console.log("🧠 Admin joined admin-room");
-      }
+    socket.on("admin:start-question", async ({ category, question }) => {
+      if (user.role !== "admin") return;
 
-      if (user.role === "team") {
-        socket.join("teams-room");
-
-        /* MULTI DEVICE PROTECTION */
-
-        const existingTeam = await Team.findById(user.id);
-
-        if (
-          existingTeam?.currentSocketId &&
-          existingTeam.currentSocketId !== socket.id
-        ) {
-          io.to(existingTeam.currentSocketId).emit("force:logout", {
-            message: "Logged in from another device",
-          });
-        }
-
-        await Team.findByIdAndUpdate(user.id, {
-          currentSocketId: socket.id,
-        });
-      }
-
-      /* ───── ONLINE TEAM COUNT ───── */
-
-      const teamSockets = await io.in("teams-room").fetchSockets();
-
-      io.to("admin-room").emit("teams:online", {
-        count: teamSockets.length,
-      });
-
-      /* ───── ACTIVE ROUND RESTORE ───── */
-
-      const activeRound = await Round.findOne({
+      const existing = await Round.findOne({
         status: { $in: ["bidding", "reviewing"] },
       });
 
-      if (activeRound) {
-        socket.emit("round:restore", {
-          roundNumber: activeRound.roundNumber,
-          title: activeRound.title,
-          category: activeRound.category,
-          status: activeRound.status,
-          bids: activeRound.bids,
-          winnerName: activeRound.winnerName,
-          winningBid: activeRound.winningBid,
-        });
+      if (existing) return; // prevent double round
+
+      const newRound = await Round.create({
+        category,
+        title: question.question,
+        options: question.options,
+        status: "bidding",
+        bids: [],
+        createdAt: new Date(),
+      });
+
+      io.emit("projector:show-question", {
+        question: question.question,
+        options: question.options,
+        category,
+      });
+
+      io.emit("bidding:start");
+    });
+
+    /* =====================================================
+       TEAM PLACE BID (ANTI-SPAM)
+    ===================================================== */
+
+    socket.on("team:place-bid", async ({ amount }) => {
+      if (user.role !== "team") return;
+
+      const round = await Round.findOne({ status: "bidding" });
+      if (!round) return;
+
+      const existingBid = round.bids.find(
+        (b) => b.teamId.toString() === user.id
+      );
+
+      if (existingBid) return; // only one bid allowed
+
+      round.bids.push({
+        teamId: user.id,
+        teamName: user.teamName,
+        amount,
+        timestamp: new Date(),
+      });
+
+      await round.save();
+
+      io.emit("bidding:update", round.bids);
+    });
+
+    /* =====================================================
+       ADMIN END BIDDING
+    ===================================================== */
+
+    socket.on("admin:end-bidding", async () => {
+      if (user.role !== "admin") return;
+
+      const round = await Round.findOne({ status: "bidding" });
+      if (!round) return;
+
+      round.status = "reviewing";
+
+      const sorted = [...round.bids].sort((a,b)=>{
+        if (b.amount !== a.amount) return b.amount - a.amount;
+        return new Date(a.timestamp) - new Date(b.timestamp);
+      });
+
+      if (sorted.length === 0) return;
+
+      const winner = sorted[0];
+
+      round.winnerId = winner.teamId;
+      round.winnerName = winner.teamName;
+      round.winningBid = winner.amount;
+      await round.save();
+
+      io.emit("projector:show-winner", winner);
+
+      /* SERVER TIMER AUTHORITY */
+
+      let timeLeft = 60;
+
+      const timer = setInterval(()=>{
+        timeLeft--;
+        io.emit("projector:timer",{timeLeft});
+
+        if(timeLeft<=0){
+          clearInterval(timer);
+          io.emit("projector:timeup");
+          io.emit("admin:auto-wrong");
+        }
+
+      },1000);
+    });
+
+    /* =====================================================
+       TEAM SUBMIT ANSWER (LOCKED)
+    ===================================================== */
+
+    socket.on("team:submit-answer", async ({ answer }) => {
+      if (user.role !== "team") return;
+
+      const round = await Round.findOne({ status: "reviewing" });
+      if (!round) return;
+
+      if (round.winnerId.toString() !== user.id) return;
+      if (round.submittedAnswer) return; // prevent resubmit
+
+      round.submittedAnswer = answer;
+      await round.save();
+
+      io.emit("projector:selected-answer", {
+        teamName: user.teamName,
+        answer,
+      });
+
+      io.to("admin-room").emit("admin:answer-received", {
+        teamName: user.teamName,
+        answer,
+      });
+    });
+
+    /* =====================================================
+       ADMIN RESULT
+    ===================================================== */
+
+    socket.on("admin:result", async ({ result }) => {
+      if (user.role !== "admin") return;
+
+      const round = await Round.findOne({ status: "reviewing" });
+      if (!round) return;
+
+      const team = await Team.findById(round.winnerId);
+
+      let reward =
+        round.category === "Easy" ? 100 :
+        round.category === "Medium" ? 250 : 350;
+
+      if(result==="correct"){
+        team.coins += reward;
+      } else {
+        team.coins = Math.max(0, team.coins - round.winningBid);
       }
 
-      /* ───────────────── ADMIN SOCKET EVENTS ───────────────── */
+      /* ELIMINATION RULE */
 
-      socket.on("admin:end-bidding", async () => {
-        if (user.role !== "admin") return;
+      if(team.coins <= 0){
+        team.coins = 0;
+        team.isActive = false;
+      }
 
-        try {
-          const round = await Round.findOne({ status: "bidding" });
-          if (!round) return;
+      await team.save();
 
-          round.status = "reviewing";
-          round.biddingEndedAt = new Date();
+      io.emit("projector:result", { result });
 
-          const sorted = [...round.bids].sort((a, b) => {
-            if (b.amount !== a.amount) return b.amount - a.amount;
-            return new Date(a.timestamp) - new Date(b.timestamp);
-          });
+      const teams = await Team.find({}).sort({coins:-1});
 
-          if (sorted.length > 0) {
-            round.winnerId = sorted[0].teamId;
-            round.winnerName = sorted[0].teamName;
-            round.winningBid = sorted[0].amount;
-          }
+      io.emit("leaderboard:update", teams);
+    });
 
-          await round.save();
+    /* =====================================================
+       AUTO WRONG (TIMEOUT)
+    ===================================================== */
 
-          io.emit("bidding:ended", {
-            winner: sorted[0] || null,
-          });
+    socket.on("admin:auto-wrong", async () => {
 
-        } catch (err) {
-          console.log("End bidding error:", err.message);
-        }
-      });
+      const round = await Round.findOne({ status:"reviewing" });
+      if(!round) return;
 
-      socket.on("admin:result", async ({ result }) => {
-        if (user.role !== "admin") return;
+      const team = await Team.findById(round.winnerId);
 
-        try {
-          const round = await Round.findOne({ status: "reviewing" });
-          if (!round || !round.winnerId) return;
+      team.coins = Math.max(0, team.coins - round.winningBid);
 
-          const team = await Team.findById(round.winnerId);
+      if(team.coins <= 0){
+        team.coins = 0;
+        team.isActive = false;
+      }
 
-          let reward =
-            round.category === "Easy" ? 200 :
-            round.category === "Medium" ? 400 : 600;
+      await team.save();
 
-          if (result === "correct") {
-            team.coins += reward;
-          } else {
-            team.coins = Math.max(0, team.coins - round.winningBid);
-          }
+      io.emit("projector:result",{result:"wrong"});
+    });
 
-          await team.save();
+    /* =====================================================
+       ONLINE TEAM COUNT
+    ===================================================== */
 
-          round.result = result;
-          round.status = "completed";
-          round.completedAt = new Date();
-          await round.save();
+    const teamSockets = await io.in("teams-room").fetchSockets();
+    io.to("admin-room").emit("teams:online", {
+      count: teamSockets.length,
+    });
 
-          const teams = await Team.find({ isActive: true }).sort({ coins: -1 });
-
-          const leaderboard = teams.map((t, i) => ({
-            rank: i + 1,
-            teamName: t.teamName,
-            coins: t.coins,
-          }));
-
-          io.emit("round:completed", {
-            winner: round.winnerName,
-            leaderboard,
-          });
-
-        } catch (err) {
-          console.log("Result error:", err.message);
-        }
-      });
-
-      /* ───────────────── HEARTBEAT ───────────────── */
-
-      socket.on("ping", () => {
-        socket.emit("pong", { ts: Date.now() });
-      });
-
-      /* ───────────────── DISCONNECT ───────────────── */
-
-      socket.on("disconnect", async () => {
-        try {
-          console.log("❌ socket disconnected");
-
-          if (user.role === "team") {
-            await Team.findByIdAndUpdate(user.id, { currentSocketId: null });
-          }
-
-          const remainingTeams = await io.in("teams-room").fetchSockets();
-
-          io.to("admin-room").emit("teams:online", {
-            count: remainingTeams.length,
-          });
-
-        } catch (err) {
-          console.log("Disconnect error:", err.message);
-        }
-      });
-
-    } catch (err) {
-      console.log("Socket connection failure:", err.message);
-    }
   });
 };
